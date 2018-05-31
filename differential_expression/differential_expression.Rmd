@@ -1,0 +1,349 @@
+---
+title: "Differential Expression"
+author: "`r getOption('author')`"
+date: "`r Sys.Date()`"
+bibliography: bibliography.bib
+params:
+    bcb_file: "data/2018-05-14/bcb.rda"
+    design: !r formula("~ centerName + subjectIsAffected")
+    contrast: !r c("subjectIsAffected", "Yes", "No")
+    alpha: 0.01
+    lfc_threshold: 0
+    data_dir: !r file.path("data", Sys.Date())
+    results_dir: !r file.path("results", Sys.Date(), "differential_expression")
+    dropbox_dir: !r file.path("dbgap-16400-phs000747.v2.p1", "results", Sys.Date(), "differential_expression")
+---
+
+```{r setup, message=FALSE}
+# Last modified 2018-05-21
+bcbioRNASeq::prepareRNASeqTemplate()
+source("_setup.R")
+
+# Directory paths ==============================================================
+invisible(mapply(
+    FUN = dir.create,
+    path = c(params$data_dir, params$results_dir),
+    MoreArgs = list(showWarnings = FALSE, recursive = TRUE)
+))
+
+# Load object ==================================================================
+bcb_name <- load(params$bcb_file)
+bcb <- get(bcb_name, inherits = FALSE)
+stopifnot(is(bcb, "bcbioRNASeq"))
+invisible(validObject(bcb))
+
+interesting_groups <- c("subjectIsAffected", "centerName")
+rdrop2::drop_auth()
+```
+
+```{r header, child="_header.Rmd"}
+```
+
+
+
+```{r sra_run_table}
+sra_run_table <- read_tsv("SRP044860/SraRunTable.txt") %>%
+    camel() %>%
+    mutate(sampleName = run) %>%
+    mutate_all(as.factor)
+sra_run_table
+saveData(sra_run_table, dir = params$data_dir)
+```
+
+There are `r nrow(sra_run_table)` samples in total from the dbGaP dataset. Not all of these are RNA-seq samples however. Here's the list of all RNA-seq samples available:
+
+```{r sra_rnaseq}
+sra_rnaseq <- filter(sra_run_table, assayType == "RNA-Seq")
+sra_rnaseq
+saveData(sra_rnaseq, dir = params$data_dir)
+```
+
+There are `r nrow(sra_rnaseq)` RNA-seq samples available for analysis. I had to censor the **SRR1525380** sample from downstream analysis due to a technical issue with transcript-to-gene mapping when running the bcbio RNA-seq pipeline in fast mode.
+
+The Odyssey cluster is having trouble with disk space and memory when attempting to analyze the dbGaP dataset with the full bcbio RNA-seq pipeline (STAR mapping for MultiQC, BAM file generation). We're looking into fixing this issue with FAS RC, but for the time being I generated the counts using salmon, with the same settings we used for the previous analysis. If necessary, we can later include this sample, but it shouldn't change the conclusions significantly.
+
+```{r sample_data}
+sample_data <- sra_rnaseq %>%
+    as.data.frame() %>%
+    mutate(
+        # Sanitize `centerName` column, otherwise DESeq2 will message about invalid
+        # names in use for design formula
+        centerName = str_extract(centerName, "^[A-Za-z]+"),
+        # Ensure `subjectIsAffected` reference level is "No" (control)
+        subjectIsAffected = relevel(subjectIsAffected, ref = "No")
+    ) %>%
+    # Strings as factors
+    mutate_if(is.character, as.factor) %>%
+    set_rownames(.$run) %>%
+    .[colnames(bcb), ]
+```
+
+Here's a vector of the control samples:
+
+```{r control_samples}
+control_samples <- sample_data %>%
+    filter(subjectIsAffected == "No") %>%
+    pull(run) %>%
+    sort()
+print(control_samples)
+```
+
+And a vector of the ALS patient samples:
+
+```{r als_samples}
+als_samples <- sample_data %>%
+    filter(subjectIsAffected == "Yes") %>%
+    pull(run) %>%
+    sort()
+print(als_samples)
+```
+
+```{r update_object}
+sampleData(bcb) <- sample_data
+interestingGroups(bcb) <- interesting_groups
+saveData(bcb, dir = params$data_dir)
+```
+
+Let's check the correlation of samples across experiments, by plotting PCA and Pearson correlation.
+
+```{r plot_pca}
+plotPCA(bcb, interestingGroups = "subjectIsAffected", label = FALSE)
+plotPCA(bcb, interestingGroups = interesting_groups, label = FALSE)
+plotPCA(bcb, interestingGroups = interesting_groups, label = TRUE)
+```
+
+```{r plot_correlation_heatmap}
+plotCorrelationHeatmap(bcb, interestingGroups = interesting_groups)
+```
+
+The **SRR1525353** run is a clear outlier and will be censored from the DE analysis.
+
+```{r bcb_censor}
+# Runs to censor
+censor <- c("SRR1525353", "SRR1525380")
+keep <- setdiff(colnames(bcb), censor)
+bcb_censor <- bcb[, keep]
+bcb_censor
+colnames(bcb_censor)
+saveData(bcb_censor, dir = params$data_dir)
+```
+
+```{r replot_correlation}
+plotPCA(bcb_censor, interestingGroups = "subjectIsAffected")
+plotPCA(bcb_censor, interestingGroups = interesting_groups)
+plotCorrelationHeatmap(bcb_censor, interestingGroups = interesting_groups)
+```
+
+Now we're ready to aggregate the runs per sample.
+
+```{r aggregate, results="hide"}
+# Aggregate dataset to RangedSummarizedExperiment
+bcb_censor$bioSample
+# Use the `aggregate` column in `colData()` to define groupings
+bcb_censor$aggregate <- bcb_censor$bioSample
+rse_agg <- aggregateReplicates(bcb_censor)
+stopifnot(is(rse_agg, "RangedSummarizedExperiment"))
+
+# Update the colData with useful columns (interestingGroups)
+col_data <- colData(bcb_censor) %>%
+    as.data.frame() %>%
+    remove_rownames() %>%
+    select(bioSample, centerName, subjectIsAffected, submittedSubjectID) %>%
+    rename(sampleName = bioSample) %>%
+    distinct() %>%
+    set_rownames(.$sampleName) %>%
+    as("DataFrame")
+stopifnot(identical(rownames(col_data), colnames(rse_agg)))
+colData(rse_agg) <- col_data
+
+# Slot the interesting groups into metadata
+interestingGroups(rse_agg) <- interesting_groups
+
+saveData(rse_agg, dir = params$data_dir)
+```
+
+Now we're ready to load [DESeq2][] and perform the differential expression analysis.
+
+```{r dds}
+# DESeq requires integer counts
+assay(rse_agg) <- round(assay(rse_agg))
+
+# Use the constructor to generate the DESeqDataSet
+# help("DESeqDataSet", "DESeq2")
+dds <- DESeqDataSet(
+    se = rse_agg,
+    design = params$design
+)
+dds <- DESeq(dds)
+resultsNames(dds)
+
+# VST is way faster for datasets with many samples
+rld <- varianceStabilizingTransformation(dds)
+
+saveData(dds, rld, dir = params$data_dir)
+```
+
+Let's double check the QC on the aggregate samples
+
+```{aggregate_qc}
+plotPCA(rld, intgroup = interesting_groups)
+plotCorrelationHeatmap(rld, interestingGroups = interesting_groups)
+```
+
+
+
+# Results
+
+```{r results}
+# help("results", "DESeq2")
+# For contrast argument as character vector:
+#   1. Design matrix factor of interest.
+#   2. Numerator for LFC (expt).
+#   3. Denominator for LFC (control).
+res_unshrunken <- results(
+    object = dds,
+    contrast = params$contrast,
+    alpha = params$alpha
+)
+
+# DESeqResults with shrunken log2 fold changes (LFC)
+# help("lfcShrink", "DESeq2")
+# Use the correct `coef` number to modify from `resultsNames(dds)`
+res_shrunken <- lfcShrink(
+    dds = dds,
+    contrast = params$contrast,
+    res = res_unshrunken
+)
+
+# Use shrunken LFC values by default
+res <- res_shrunken
+saveData(res, res_shrunken, res_unshrunken, dir = params$data_dir)
+```
+
+We performed the analysis using a BH adjusted *P* value cutoff of `r params$alpha` and a log fold-change (LFC) ratio cutoff of `r params$lfc_threshold`.
+
+
+
+# Plots
+
+Genes of interest to label on the DEG plots.
+
+```{r genes_of_interest}
+gene2symbol <- gene2symbol(dds)
+saveData(gene2symbol, dir = params$data_dir)
+genes <- c(
+    TARDBP = "ENSG00000120948",
+    STMN2 = "ENSG00000104435"
+)
+plotGene(rld, genes = genes)
+```
+
+## Mean average (MA)
+
+An MA plot compares transformed counts on `M` (log ratio) and `A` (mean average) scales [@Yang:2002ty].
+
+```{r plot_ma}
+plotMeanAverage(
+    object = res,
+    genes = genes,
+    gene2symbol = gene2symbol
+)
+
+# Alternate plot
+# DESeq2::plotMA(res)
+```
+
+
+## Volcano
+
+A volcano plot compares significance (BH-adjusted *P* value) against fold change (log2) [@Cui:2003kh; @Li:2014fv]. Genes in the green box with text labels have an adjusted *P* value are likely to be the top candidate genes of interest.
+
+```{r plot_volcano}
+plotVolcano(
+    object = res,
+    lfcThreshold = params$lfc_threshold,
+    genes = genes,
+    gene2symbol = gene2symbol
+)
+```
+
+
+## Heatmap
+
+This plot shows only differentially expressed genes on a per-sample basis. We have scaled the data by row and used the `ward.D2` method for clustering [@WardJr:1963eu].
+
+```{r plot_deg_heatmap}
+# help("pheatmap", "pheatmap")
+plotDEGHeatmap(
+    results = res,
+    counts = rld,
+    interestingGroups = interesting_groups,
+    clusteringMethod = "ward.D2",
+    scale = "row"
+)
+```
+
+
+## PCA
+
+```{r plot_deg_pca}
+plotDEGPCA(
+    results = res,
+    counts = rld,
+    interestingGroups = "subjectIsAffected",
+    label = FALSE
+)
+plotDEGPCA(
+    results = res,
+    counts = rld,
+    interestingGroups = interesting_groups,
+    label = FALSE
+)
+plotDEGPCA(
+    results = res,
+    counts = rld,
+    interestingGroups = interesting_groups,
+    label = TRUE
+)
+```
+
+
+
+# Results tables
+
+```{r results_tables, results="asis"}
+res_tbl <- resultsTables(
+    results = res,
+    counts = dds,
+    lfcThreshold = params$lfc_threshold,
+    write = TRUE,
+    summary = TRUE,
+    headerLevel = 2,
+    dir = params$results_dir,
+    dropboxDir = params$dropbox_dir
+)
+saveData(res_tbl, dir = params$data_dir)
+```
+
+Differentially expressed gene (DEG) tables are sorted by BH-adjusted P value, and contain the following columns:
+
+- `baseMean`: Mean of the normalized counts per gene for all samples.
+- `log2FoldChange`: log2 fold change.
+- `lfcSE`: log2 standard error.
+- `stat`: Wald statistic.
+- `pvalue`: Walt test *P* value.
+- `padj`: BH adjusted Wald test *P* value (corrected for multiple comparisons; aka FDR).
+
+
+## Top tables
+
+Only the top up- and down-regulated genes (arranged by log2 fold change) are shown.
+
+```{r top_tables, results="asis"}
+topTables(res_tbl)
+```
+
+
+
+```{r footer, child="_footer.Rmd"}
+```
