@@ -1,7 +1,7 @@
 # v0.2.4
 library(bcbioRNASeq)
 bcb <- bcbioRNASeq(
-    uploadDir = "bcbio/final",
+    uploadDir = "bcbio-fastrnaseq/final",
     organism = "Homo sapiens",
     genomeBuild = "GRCh37",
     gffFile = "Homo_sapiens.GRCh37.87.gtf.gz",
