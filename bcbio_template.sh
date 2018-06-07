@@ -1,6 +1,6 @@
-bcbio_nextgen.py -w template bcbio-rnaseq.yaml bcbio.csv *.fastq.gz
+bcbio_nextgen.py -w template bcbio.yaml bcbio.csv SRS*.fastq.gz
 
-cd bcbio-rnaseq/work
+cd bcbio/work
 
 # symlinks
 ln -s ../../bcbio_system.yaml .
